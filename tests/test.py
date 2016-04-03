@@ -315,6 +315,7 @@ class RMLRUTest(unittest.TestCase):
 
             res = self.redis_delegator.try_write_back(sr, 'users:1')
             self.assertFalse(sr.sismember(KEYS_MODIFIED_SET, users.friends.key_name))
+            # strange!!
             # self.assertTrue(sr.zrank(LRU_QUEUE, users.friends.key_name) is None)
             doc1 = self.db.users.find_one({'uid': 1}, {'uid': 0, '_id': 0})
             self.assertEqual(doc, doc1)
