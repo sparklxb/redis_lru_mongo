@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -51,24 +50,6 @@ def acquire_lock_with_timeout(conn, key_name, lock_timeout=LOCK_TIMEOUT):
     lockname = make_lockname(key_name)
     conn.setex(lockname, lock_timeout, identifier)
 
-def handle_result_from_redis(is_single_value=True):
-    def _handle_result_from_redis(function):
-        def __handle_result_from_redis(self, *args, **kw):
-            res = function(self, *args, **kw)
-            
-            if self.field_type:
-                if is_single_value:
-                    if res:
-                        res = self.field_type.get(res)
-                else:
-                    res = [self.field_type.get(v) for v in res]
-            elif not is_single_value:
-                res = list(res)
-
-            return res
-        return __handle_result_from_redis
-    return _handle_result_from_redis
-
 class IndirectField(object):
     def set(self, val) :
         raise NotImplementedError()
@@ -100,6 +81,7 @@ class NumberField(IndirectField):
 
 class ComplexField(object):
     """
+    field_type: IndirectField or None (for string)
     field_name: field_name in mongo
     key_name: [collection name]:[key in mongo].[field_name in mongo]
     """
@@ -120,8 +102,33 @@ class ComplexField(object):
         """
         raise NotImplementedError()
 
-    def get_all_items(self):
+    def get(self):
         raise NotImplementedError()
+
+    def set(self, val):
+        raise NotImplementedError()
+
+    def _handle_members_list(self, member_score_list, is_set=True):
+        if isinstance(self.field_type, IndirectField):
+            tmp = list()
+            if is_set:
+                f = self.field_type.set
+            else:
+                f = self.field_type.get
+            for v in member_score_list:
+                tmp.append(f(v))
+            return tmp
+        else:
+            return member_score_list
+
+    def _handle_one_member(self, val, is_set=True):
+        if isinstance(self.field_type, IndirectField):
+            if is_set:
+                return self.field_type.set(val)
+            else:
+                return self.field_type.get(val)
+        else:
+            return val
 
     def record_modify(self):
         self.conn.sadd(KEYS_MODIFIED_SET, self.key_name)
@@ -137,6 +144,17 @@ class ZsetField(ComplexField):
         self.member_type = member_type
         self.score_name = score_name
         self.score_type = score_type
+
+    def _handle_members_list(self, member_score_list):
+        if isinstance(self.member_type, IndirectField):
+            i = 1
+            tmp = list()
+            while i < len(member_score_list):
+                tmp.append(self.member_type.set(member_score_list[i]))
+                i += 2
+            return tmp
+        else:
+            return member_score_list
 
     def __set__(self, obj, val):
         self.key_name = make_sub_key_name(obj._key, self.field_name)
@@ -155,6 +173,7 @@ class ZsetField(ComplexField):
                 else :
                     print "Error: %s miss %s or %s" % (str(v), self.member_name, self.score_name)
             if member_score_list:
+                self._handle_members_list(member_score_list)
                 self.conn.zadd(self.key_name, *member_score_list)
         self.conn.execute()
 
@@ -173,6 +192,7 @@ class ZsetField(ComplexField):
 
     def zadd(self, *values, **kwargs):
         self.record_modify()
+        values = self._handle_members_list(values)
         return self.conn.zadd(self.key_name, *values, **kwargs)
 
     def zscore(self, member):
@@ -180,18 +200,22 @@ class ZsetField(ComplexField):
         ignore _document_just_loaded_from_mongo, because zscore is more direct and easy
         """
         score = self.conn.zscore(self.key_name, member)
-        if self.score_type is not float:
+        if score and self.score_type is not float:
             score = self.score_type(score)
         return score
 
     def zrem(self, *values):
         self.record_modify()
+        values = self._handle_members_list(values)
         return self.conn.zrem(self.key_name, *values)
 
     def zrange(self, start, end):
         res = self.col.get_from_just_loaded(self.field_name)
         if res:
-            return res[start: end]
+            if -1 != end:
+                return res[start: end+1]
+            else:
+                return res[start:]
         else:
             values = self.conn.zrange(self.key_name, start, end, withscores=True, score_cast_func=self.score_type)
             res = list()
@@ -199,7 +223,7 @@ class ZsetField(ComplexField):
                 res.append({self.member_name: self.member_type(v[0]), self.score_name: v[1]})
             return res
 
-    def get_all_items(self):
+    def get(self):
         return self.zrange(0, -1)
 
 class SetField(ComplexField):
@@ -212,8 +236,7 @@ class SetField(ComplexField):
 
         self.conn.delete(self.key_name)
         if val:
-            if self.field_type:
-                val = [self.field_type.set(v) for v in val]
+            val = self._handle_members_list(val)
             self.conn.sadd(self.key_name, *val)
         self.conn.execute()
 
@@ -232,8 +255,7 @@ class SetField(ComplexField):
 
     def sadd(self, *values):
         self.record_modify()
-        if self.field_type:
-            values = [self.field_type.set(v) for v in values]
+        values = self._handle_members_list(values)
         return self.conn.sadd(self.key_name, *values)
 
     def sismember(self, val):
@@ -241,27 +263,21 @@ class SetField(ComplexField):
         if res:
             return val in res
         else:
-            if self.field_type:
-                val = self.field_type.set(val)
+            val = self._handle_one_member(val)
             return self.conn.sismember(self.key_name, val)
 
-    @handle_result_from_redis(False)
     def smembers(self):
-        """
-        return list!
-        """
         val = self.col.get_from_just_loaded(self.field_name)
         if not val:
             val = self.conn.smembers(self.key_name)
-        return val
+        return set(val)
 
-    get_all_items = smembers
+    get = smembers
 
     def srem(self, *values):
         self.record_modify()
 
-        if self.field_type:
-            values = [self.field_type.set(v) for v in values]
+        values = self._handle_members_list(values)
         return self.conn.srem(self.key_name, *values)
 
 class ListField(ComplexField):
@@ -273,20 +289,24 @@ class ListField(ComplexField):
 
         self.conn.delete(self.key_name)
         if val:
-            if self.field_type:
-                val = [self.field_type.set(v) for v in val]
+            val = self._handle_members_list(val)
             self.conn.rpush(self.key_name, *val)
         self.conn.execute()
 
         self.conn = obj.redis_delegate.conn
 
-    def __getattr__(self, name):
-        if name in ['lrem', 'ltrim']:
-            self.record_modify()
+    def lrem(self, count, val):
+        self.record_modify()
 
-            return partial(self.conn.__getattr__(name), self.key_name)
-        else:
-            raise AttributeError, name + 'not allowed currently'
+        val = self._handle_one_member(val)
+        val = self.conn.lrem(self.key_name, count, val)
+        return val
+
+    def ltrim(self, start, end):
+        self.record_modify()
+
+        val = self.conn.ltrim(self.key_name, start, end)
+        return val
 
     def llen(self):
         res = self.col.get_from_just_loaded(self.field_name)
@@ -295,7 +315,6 @@ class ListField(ComplexField):
         else:
             return self.conn.llen(self.key_name)
 
-    @handle_result_from_redis()
     def lindex(self, index):
         res = self.col.get_from_just_loaded(self.field_name)
         if res:
@@ -305,9 +324,9 @@ class ListField(ComplexField):
                 return None
         else:
             val = self.conn.lindex(self.key_name, index)
+            val = self._handle_one_member(val, False)
             return val
 
-    @handle_result_from_redis()
     def lpop(self):
         self.record_modify()
 
@@ -318,20 +337,22 @@ class ListField(ComplexField):
         self.record_modify()
 
         if values:
-            if self.field_type:
-                values = [self.field_type.set(v) for v in values]
+            values = self._handle_members_list(values)
             return self.conn.rpush(self.key_name, *values)
 
-    @handle_result_from_redis(False)
     def lrange(self, start, end):
         res = self.col.get_from_just_loaded(self.field_name)
         if res:
-            return res[start: end]
+            if -1 != end:
+                return res[start: end+1]
+            else:
+                return res[start:]
         else:
             values = self.conn.lrange(self.key_name, start, end)
+            values = self._handle_members_list(values, False)
             return values
 
-    def get_all_items(self):
+    def get(self):
         return self.lrange(0, -1)
 
 class CollectionMetaclass(type):
@@ -375,6 +396,7 @@ class CollectionBase(object):
     _is_already_in_redis = False
     # just a trick for make_data_in_redis
     _need_record_modify = True
+    _need_lock = True
     _ignore_field_names = list()
 
     redis_delegate = None
@@ -439,10 +461,15 @@ class CollectionBase(object):
         for cls in self.__class__.__mro__ + (self, ):
             if attr in cls.__dict__:
                 return object.__setattr__(self, attr, value)
-        self.make_data_in_redis(need_hash=True)
-        self.redis_delegate.conn.hset(self._key, attr, value)
-
-        self.record_modify()
+        # self.make_data_in_redis(need_hash=True)
+        if value is None:
+            mongo_col = getattr(self.redis_delegate.mongo_conn, self._col_name)
+            mongo_key = self._mongo_key
+            self.redis_delegate.conn.hdel(self._key, attr)
+            mongo_col.update({self._key_name: mongo_key}, {"$set": {attr: None}}, True)
+        else:
+            self.redis_delegate.conn.hset(self._key, attr, value)
+            self.record_modify()
 
     def __getattr__(self, attr):
         self.make_data_in_redis(need_hash=True)
@@ -459,7 +486,7 @@ class CollectionBase(object):
     def make_data_in_redis(self, field_names=(), need_hash=False):
         '''
         self: collection_self
-        if sub_key_names=None, need_hash=False, reload all data in the collection
+        if field_names is () and need_hash=False, reload all data in the collection
         '''
         if self.is_already_in_redis():
             return
@@ -477,18 +504,22 @@ class CollectionBase(object):
 
         if not field_names and not need_hash:
             sub_key_names, field_names = all_sub_key_names, all_field_names
+            need_hash = True
         else:
             sub_key_names = map(partial(make_sub_key_name, self._key), field_names)
 
         for sub_key_name, field_name in zip(sub_key_names, field_names):
-            acquire_lock_with_timeout(conn, sub_key_name)
-            
+            if self._need_lock:
+                acquire_lock_with_timeout(conn, sub_key_name)
+            self.redis_delegate.conn.zadd(LRU_QUEUE, time.time(), sub_key_name)
             if not conn.exists(sub_key_name):
                 ##print "try_fetch:", sub_key_name
                 field_name_not_in_redis_list.append(field_name)
 
         if need_hash:
-            acquire_lock_with_timeout(conn, self._key)
+            if self._need_lock:
+                acquire_lock_with_timeout(conn, self._key)
+            self.redis_delegate.conn.zadd(LRU_QUEUE, time.time(), self._key)
 
             if conn.exists(self._key):
                 need_hash = False
@@ -530,57 +561,68 @@ class CollectionBase(object):
         return self.get_hashes_by_dict(res)
 
     def update(self, doc_dict):
-        assert (self._key_name in doc_dict)
         doc_dict = deepcopy(doc_dict)
-        key = doc_dict.pop(self._key_name)
-        self._key = make_key_name(self._col_name, key)
-        self._mongo_key = key
 
         for field_name in self.get_all_class_var_names():
             if field_name in doc_dict:
                 getattr(self, field_name).__set__(self, doc_dict.pop(field_name))
 
         if doc_dict:
-            self.redis_delegate.conn.hmset(self._key, doc_dict)
+            for k, v in doc_dict.items():
+                if v is None:
+                    doc_dict.pop(k)
+                    self.redis_delegate.conn.hdel(self._key, k)
+            if doc_dict:
+                self.redis_delegate.conn.hmset(self._key, doc_dict)
             self.record_modify()
 
-    def find(self, key, field_name_list):
+    def find(self, key, field_name_list=None):
         res = dict()
-        common_field_name_list = list()
-        complex_field_name_list = list()
-        self._key = make_key_name(self._col_name, key)
-        self._mongo_key = key
-
-        all_complex_field_name = self.get_all_class_var_names()
-        for field_name in field_name_list:
-            if field_name in all_complex_field_name:
-                complex_field_name_list.append(field_name)
+        if field_name_list is None:
+            self.make_data_in_redis()
+            if self._document_just_loaded_from_mongo:
+                return self._document_just_loaded_from_mongo
             else:
-                common_field_name_list.append(field_name)
+                res = self._get_all_hashes(key)
+                for field_name in self.get_all_class_var_names():
+                    res[field_name] = getattr(self, field_name).get()
+            return res
+        else:
+            common_field_name_list = list()
+            complex_field_name_list = list()
+            self._key = make_key_name(self._col_name, key)
+            self._mongo_key = key
 
-        self.make_data_in_redis(complex_field_name_list, bool(common_field_name_list))
-        self.turn_on_already_in_redis()
-        for field_name in complex_field_name_list:
-            _res = self.get_from_just_loaded(field_name)
-            if _res:
-                res[field_name] = _res
-            else:
-                res[field_name] = getattr(self, field_name).get_all_items()
+            if field_name_list:
+                all_complex_field_name = self.get_all_class_var_names()
+                for field_name in field_name_list:
+                    if field_name in all_complex_field_name:
+                        complex_field_name_list.append(field_name)
+                    else:
+                        common_field_name_list.append(field_name)
+            self.make_data_in_redis(complex_field_name_list, bool(common_field_name_list))
+            self.turn_on_already_in_redis()
+            for field_name in complex_field_name_list:
+                _res = self.get_from_just_loaded(field_name)
+                if _res:
+                    res[field_name] = _res
+                else:
+                    res[field_name] = getattr(self, field_name).get()
 
-        for field_name in common_field_name_list:
-            _res = self.get_from_just_loaded(field_name)
-            if _res:
-                res[field_name] = _res
-            else:
-                res[field_name] = getattr(self, field_name)
-        self.turn_off_already_in_redis()
+            for field_name in common_field_name_list:
+                _res = self.get_from_just_loaded(field_name)
+                if _res:
+                    res[field_name] = _res
+                else:
+                    res[field_name] = getattr(self, field_name)
+            self.turn_off_already_in_redis()
         return res
 
-    def write_back(self, key, field_name):
+    def write_back(self, key, field_name=None):
         mongo_col = getattr(self.redis_delegate.mongo_conn, self._col_name)
         #conn = self.redis_delegate.conn
         if field_name:
-            res_list = getattr(self(key), field_name).get_all_items()
+            res_list = getattr(self(key), field_name).get()
             mongo_col.update({self._key_name: key}, {"$set": {field_name: res_list}}, True)
         else:
             res_dict = self._get_all_hashes(key)
@@ -640,7 +682,10 @@ class RedisDelegate(object):
                 else:
                     if ismember:
                         col_name, key, field_name = self.parse_sub_key_name(key_name)
-                        getattr(self, col_name).write_back(key, field_name)
+                        col = getattr(self, col_name)
+                        col._need_lock = False
+                        col.write_back(key, field_name)
+                        col._need_lock = True
                         ##print "write_back", key_name
 
                     pipe.multi()
@@ -649,9 +694,9 @@ class RedisDelegate(object):
                         pipe.srem(KEYS_MODIFIED_SET, key_name)
                     pipe.zrem(LRU_QUEUE, key_name)
                     pipe.delete(lockname)
-                    pipe.execute()
+                    res = pipe.execute()
                     return True
-            except redis.exceptions.WatchError:
+            except redis.exceptions.WatchError, e:
                 return False
 
     def check_overload(self, interval=5, lru_queue_num_min=10000, lru_queue_num_max=15000, scheduler_dict=None):

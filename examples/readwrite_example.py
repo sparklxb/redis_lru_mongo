@@ -1,10 +1,9 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import redis
 from pymongo import MongoClient
 
-from redis_lru_scheduler import RedisDelegate, CollectionBase, SetField, ListField, ZsetField, DictField
+from rmlru import RedisDelegate, CollectionBase, SetField, ListField, ZsetField, DictField
 
 class Resources(CollectionBase):
     _key_name = 'res_id'
